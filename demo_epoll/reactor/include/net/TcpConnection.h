@@ -1,19 +1,19 @@
 #pragma once
 
+#include "net/Buffer.h"
+
 #include <functional>
 #include <memory>
 #include <string>
 
-#include "net/Buffer.h"
-
 class Channel;
+class EventLoop;
 
 class TcpConnection {
 public:
     using CloseCallback = std::function<void(int)>;
-    using UpdateCallback = std::function<void(Channel*)>;
 
-    TcpConnection(int fd, UpdateCallback updateCallback);
+    TcpConnection(int fd, EventLoop* loop);
 
     int fd() const;
     Channel* channel() const;
@@ -30,9 +30,9 @@ private:
 
 private:
     int fd_;
+    EventLoop* loop_;
     std::unique_ptr<Channel> channel_;
     CloseCallback closeCallback_;
-    UpdateCallback updateCallback_;
     Buffer inputBuffer_;
     Buffer outputBuffer_;
 };

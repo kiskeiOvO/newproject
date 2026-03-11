@@ -1,30 +1,47 @@
 #include "net/EventLoop.h"
 
 #include "net/Channel.h"
-#include "net/Epoller.h"
-#include "net/Socket.h"
 #include "net/TcpConnection.h"
 
-#include <arpa/inet.h>
-#include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <functional>
-#include <iostream>
 #include <stdexcept>
-#include <sys/socket.h>
-#include <vector>
+#include <sys/eventfd.h>
 #include <unistd.h>
+#include <vector>
 
-EventLoop::EventLoop(int listenfd)
-    : listenfd_(listenfd),
-      quit_(false),
-      listenChannel_(new Channel(listenfd)),
+namespace {
+int createEventfd() {
+    int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (fd == -1) {
+        perror("eventfd");
+        throw std::runtime_error("eventfd failed");
+    }
+    return fd;
+}
+}
+
+EventLoop::EventLoop()
+    : quit_(false),
+      callingPendingFunctors_(false),
+      threadId_(std::this_thread::get_id()),
+      wakeupFd_(createEventfd()),
+      wakeupChannel_(new Channel(wakeupFd_)),
       epoller_(new Epoller()) {
-    listenChannel_->enableReading();
-    listenChannel_->setReadCallback(std::bind(&EventLoop::handleNewConnection, this));
+    wakeupChannel_->enableReading();
+    wakeupChannel_->setReadCallback(std::bind(&EventLoop::handleWakeup, this));
 
-    channels_[listenfd_] = listenChannel_.get();
-    epoller_->addChannel(listenChannel_.get());
+    channels_[wakeupFd_] = wakeupChannel_.get();
+    epoller_->addChannel(wakeupChannel_.get());
+}
+
+EventLoop::~EventLoop() {
+    channels_.erase(wakeupFd_);
+    wakeupChannel_.reset();
+    if (wakeupFd_ >= 0) {
+        close(wakeupFd_);
+    }
 }
 
 void EventLoop::loop() {
@@ -34,7 +51,6 @@ void EventLoop::loop() {
         int n = epoller_->wait(activeEvents);
         for (int i = 0; i < n; ++i) {
             int fd = activeEvents[i].data.fd;
-
             auto it = channels_.find(fd);
             if (it == channels_.end()) {
                 continue;
@@ -44,57 +60,118 @@ void EventLoop::loop() {
             channel->setRevents(activeEvents[i].events);
             channel->handleEvent();
         }
+
+        doPendingFunctors();
     }
 }
 
-void EventLoop::handleNewConnection() {
-    while (true) {
-        sockaddr_in clientAddr{};
-        socklen_t len = sizeof(clientAddr);
-
-        int connfd = ::accept(listenfd_, reinterpret_cast<sockaddr*>(&clientAddr), &len);
-        if (connfd == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            }
-
-            perror("accept");
-            break;
-        }
-
-        if (Socket::setNonBlocking(connfd) == -1) {
-            close(connfd);
-            continue;
-        }
-
-        std::unique_ptr<TcpConnection> conn(new TcpConnection(
-            connfd, std::bind(&EventLoop::updateChannel, this, std::placeholders::_1)));
-        conn->setCloseCallback(std::bind(&EventLoop::removeConnection, this, std::placeholders::_1));
-
-        channels_[connfd] = conn->channel();
-        connections_[connfd] = std::move(conn);
-        epoller_->addChannel(channels_[connfd]);
-
-        char ip[INET_ADDRSTRLEN]{};
-        inet_ntop(AF_INET, &clientAddr.sin_addr, ip, sizeof(ip));
-        std::cout << "new client: " << ip
-                  << ":" << ntohs(clientAddr.sin_port)
-                  << ", fd=" << connfd << "\n";
+void EventLoop::quit() {
+    quit_ = true;
+    if (!isInLoopThread()) {
+        wakeup();
     }
 }
 
-void EventLoop::removeConnection(int fd) {
-    auto channelIt = channels_.find(fd);
-    if (channelIt == channels_.end()) {
+void EventLoop::runInLoop(Functor cb) {
+    if (isInLoopThread()) {
+        cb();
         return;
     }
 
-    epoller_->removeChannel(channelIt->second);
-    close(fd);
-    channels_.erase(channelIt);
-    connections_.erase(fd);
+    queueInLoop(std::move(cb));
+}
+
+void EventLoop::queueInLoop(Functor cb) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pendingFunctors_.push_back(std::move(cb));
+    }
+
+    if (!isInLoopThread() || callingPendingFunctors_) {
+        wakeup();
+    }
+}
+
+bool EventLoop::isInLoopThread() const {
+    return threadId_ == std::this_thread::get_id();
 }
 
 void EventLoop::updateChannel(Channel* channel) {
+    if (channels_.find(channel->fd()) == channels_.end()) {
+        channels_[channel->fd()] = channel;
+        epoller_->addChannel(channel);
+        return;
+    }
+
     epoller_->updateChannel(channel);
+}
+
+void EventLoop::removeChannel(Channel* channel) {
+    auto it = channels_.find(channel->fd());
+    if (it == channels_.end()) {
+        return;
+    }
+
+    epoller_->removeChannel(channel);
+    channels_.erase(it);
+}
+
+void EventLoop::addConnection(int fd) {
+    runInLoop(std::bind(&EventLoop::addConnectionInLoop, this, fd));
+}
+
+void EventLoop::wakeup() {
+    uint64_t one = 1;
+    ssize_t n = write(wakeupFd_, &one, sizeof(one));
+    if (n != static_cast<ssize_t>(sizeof(one))) {
+        perror("write wakeupFd");
+    }
+}
+
+void EventLoop::handleWakeup() {
+    uint64_t one = 0;
+    ssize_t n = read(wakeupFd_, &one, sizeof(one));
+    if (n != static_cast<ssize_t>(sizeof(one))) {
+        perror("read wakeupFd");
+    }
+}
+
+void EventLoop::doPendingFunctors() {
+    std::vector<Functor> functors;
+    callingPendingFunctors_ = true;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        functors.swap(pendingFunctors_);
+    }
+
+    for (size_t i = 0; i < functors.size(); ++i) {
+        functors[i]();
+    }
+
+    callingPendingFunctors_ = false;
+}
+
+void EventLoop::addConnectionInLoop(int fd) {
+    std::unique_ptr<TcpConnection> conn(new TcpConnection(fd, this));
+    conn->setCloseCallback(std::bind(&EventLoop::removeConnection, this, std::placeholders::_1));
+
+    Channel* channel = conn->channel();
+    connections_[fd] = std::move(conn);
+    updateChannel(channel);
+}
+
+void EventLoop::removeConnection(int fd) {
+    runInLoop(std::bind(&EventLoop::removeConnectionInLoop, this, fd));
+}
+
+void EventLoop::removeConnectionInLoop(int fd) {
+    auto it = connections_.find(fd);
+    if (it == connections_.end()) {
+        return;
+    }
+
+    removeChannel(it->second->channel());
+    close(fd);
+    connections_.erase(it);
 }

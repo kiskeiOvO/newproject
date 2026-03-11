@@ -1,6 +1,7 @@
 #include "net/TcpConnection.h"
 
 #include "net/Channel.h"
+#include "net/EventLoop.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -12,10 +13,10 @@ namespace {
 const int kBufferSize = 1024;
 }
 
-TcpConnection::TcpConnection(int fd, UpdateCallback updateCallback)
+TcpConnection::TcpConnection(int fd, EventLoop* loop)
     : fd_(fd),
-      channel_(new Channel(fd)),
-      updateCallback_(std::move(updateCallback)) {
+      loop_(loop),
+      channel_(new Channel(fd)) {
     channel_->enableReading();
     channel_->setReadCallback(std::bind(&TcpConnection::handleRead, this));
     channel_->setWriteCallback(std::bind(&TcpConnection::handleWrite, this));
@@ -109,7 +110,7 @@ void TcpConnection::send(const std::string& data) {
 }
 
 void TcpConnection::updateChannel() {
-    if (updateCallback_) {
-        updateCallback_(channel());
+    if (loop_ != nullptr) {
+        loop_->updateChannel(channel());
     }
 }

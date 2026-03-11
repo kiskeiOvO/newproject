@@ -1,36 +1,45 @@
 #include "net/EventLoop.h"
-#include "net/Socket.h"
+#include "net/TcpServer.h"
 
 #include <iostream>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <thread>
 
 namespace {
 const uint16_t kPort = 8888;
-const int kListenBacklog = 10;
+const int kListenBacklog = 128;
 }
-
+/*
+               主线程
+            ┌────────────┐
+            │ mainLoop   │
+            │ accept     │
+            └─────┬──────┘
+                  │
+             新连接 fd
+                  │
+        EventLoopThreadPool
+      ┌─────────┬─────────┬─────────┐
+      ▼         ▼         ▼
+   worker1   worker2   worker3
+   loop1     loop2     loop3
+   epoll     epoll     epoll
+*/
 int main() {
-    int listenfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listenfd == -1) {
-        perror("socket");
-        return 1;
-    }
-
-    if (Socket::setNonBlocking(listenfd) == -1) {
-        close(listenfd);
-        return 1;
-    }
-
     try {
-        Socket listenSocket(listenfd);
-        listenSocket.bindAddress(kPort);
-        listenSocket.listen(kListenBacklog);
+        EventLoop mainLoop;
+        std::cout<<std::thread::hardware_concurrency()<<std::endl;
+        int workerThreads = static_cast<int>(std::thread::hardware_concurrency());
+        if (workerThreads <= 0) {
+            workerThreads = 4;
+        }
 
-        std::cout << "epoll server listening on " << kPort << "...\n";
+        TcpServer server(&mainLoop, kPort, kListenBacklog, workerThreads);
+        server.start();
 
-        EventLoop loop(listenSocket.fd());
-        loop.loop();
+        std::cout << "main Reactor listening on " << kPort
+                  << ", worker threads=" << workerThreads << "\n";
+
+        mainLoop.loop();
     } catch (const std::exception& ex) {
         std::cerr << "fatal error: " << ex.what() << "\n";
         return 1;
